@@ -53,7 +53,7 @@ If yes → `node update-system.mjs apply`. If no → `node update-system.mjs dis
 
 ## What is career-ops
 
-AI-powered, CLI-agnostic job search automation: pipeline tracking, offer evaluation, CV generation, portal scanning, batch processing. Runs on any AI coding CLI following the [open agent skill standard](https://agentskills.io) (Claude Code, Codex, OpenCode, Qwen, Copilot, Kimi, Antigravity CLI, Grok Build CLI). Legacy Gemini API evaluation remains via `gemini-eval.mjs`.
+AI-powered, CLI-agnostic job search automation: pipeline tracking, offer evaluation, CV generation, portal scanning, batch processing. Runs on any AI coding CLI following the [open agent skill standard](https://agentskills.io) (Claude Code, Cursor, Codex, OpenCode, Qwen, Copilot, Kimi, Antigravity CLI, Grok Build CLI). Legacy Gemini API evaluation remains via `gemini-eval.mjs`.
 
 ### Codex invocation
 
@@ -82,7 +82,7 @@ AI-powered, CLI-agnostic job search automation: pipeline tracking, offer evaluat
 | `generate-pdf.mjs` | Playwright: HTML to PDF |
 | `generate-latex.mjs` | LaTeX CV validator + pdflatex compiler |
 | `scan.mjs` | Zero-token portal scanner (Greenhouse/Ashby/Lever APIs, zero LLM cost) |
-| `scan-ats-full.mjs` | Reverse-ATS keyword-first scanner over full public ATS datasets (Greenhouse/Lever/Ashby/Workday), filtered by portals.yml `title_filter`/`location_filter` — no company list needed |
+| `scan-ats-full.mjs` | Reverse-ATS keyword-first scanner over full public ATS datasets (Greenhouse/Lever/Ashby/Workday/iCIMS), filtered by portals.yml `title_filter`/`location_filter` — no company list needed; checkpoints every 500 companies, `--resume` continues an interrupted sweep |
 | `check-liveness.mjs` / `liveness-core.mjs` | Job posting liveness checker + shared logic (expired signals win over generic Apply text) |
 | `set-status.mjs` | Canonical tracker-row update: `node set-status.mjs <report#\|company> <State> [--note] [--force]` — strict states.yml validation, report-link mismatch guard, shared lock, atomic write |
 | `invite-match.mjs` | Fuzzy-match a pasted interview invite (company, date, req ID) against the tracker, ranking candidates when a company has multiple entries (JSON or `--summary`) |
@@ -194,7 +194,7 @@ Once all files exist, confirm:
 Then suggest automation:
 > "Want me to scan for new offers automatically? I can set up a recurring scan every few days so you don't miss anything. Just say 'scan every 3 days' and I'll configure it."
 
-If accepted, use the `/loop` or `/schedule` skill (if available) for a recurring scan entrypoint; otherwise suggest a cron job or periodic manual scans.
+If the user accepts, use the `/loop` or `/schedule` skill (if available) to set up a recurring scan entrypoint for their CLI (`/career-ops scan`, `/career-ops-scan`, or the equivalent Codex prompt). If those aren't available, point them to [docs/AUTOMATION.md](docs/AUTOMATION.md) for copy-paste cron / launchd / Windows Task Scheduler recipes plus a zero-token triage-to-shortlist prompt, or remind them to run the scan mode periodically.
 
 ### Personalization
 
@@ -284,6 +284,7 @@ Two separate axes:
 | Wants to classify application replies and review updates | `reply-watch` — classifies replies, matches to applications, suggests tracker updates |
 | Wants to update the system | `update` |
 | Wants to queue a request for later / check the inbox between sessions | `agent-inbox` — append-only checklist drained next session; nothing auto-submits |
+| Wants to add a finished project, paper, or role to the CV | `add` — source-grounded preview, confirm-before-write; dedup + insertion via `add-entry.mjs` |
 
 ### CV Source of Truth
 
@@ -366,6 +367,8 @@ One TSV file per evaluation at `batch/tracker-additions/{num}-{company-slug}.tsv
 **Optional Via field (#1596):** applications through an agency/recruiter append a **tagged** extra field `via={Agency}` (e.g. `via=Hays`) after notes — never positional; the tag is mandatory. A single untagged extra keeps its legacy meaning (location). Unknown end employer → `?` as company (locale-invariant marker, never "Confidential") + a descriptor in notes. `merge-tracker.mjs` rejects ambiguous extras loudly; `--migrate-via` adds the column to an existing tracker.
 
 **Report link normalization:** the TSV always carries a root-relative `[num](reports/...)` link; `merge-tracker.mjs` rewrites it relative to the tracker's own directory (`../reports/...` at `data/applications.md`, `reports/...` at root) so links stay clickable. Idempotent; fix an existing tracker with `node merge-tracker.mjs --migrate` (#760).
+
+**Req/posting ID in notes disambiguates same-title postings (#1524, #2009):** when a company posts two genuinely different requisitions whose titles fuzzy-match (e.g. a leveled variant and its bare title, or two sibling team roles), put the req/job/posting ID in the **notes** column on both rows. `merge-tracker.mjs` reads it (`REQ_NUMBER_RE`) and treats rows carrying *different* recognizable IDs as distinct openings, overriding fuzzy title matching. Recognized forms are a `job id` / `posting id` / `requisition` / `req` / `jr` / `job` / `posting` / `ref` / `r_` label followed by an alphanumeric ID containing at least one digit — e.g. `req JR-10423`, `job id 88214`, `ref R_2291`. Prefer this whenever the JD exposes an ID; it is the only signal that survives near-identical titles.
 
 ### Pipeline Integrity
 

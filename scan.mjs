@@ -44,6 +44,8 @@ import { classifyFetchError } from './verify-portals.mjs';
 import { fingerprintText, findCrossListings } from './fingerprint-core.mjs';
 import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
+import { normalizeCompanyName } from './invite-match.mjs';
+import { withPipelineLock } from './pipeline-lock.mjs';
 
 try {
   const { config } = await import('dotenv');
@@ -161,19 +163,89 @@ function normalizeKeywordList(value) {
     .filter(Boolean);
 }
 
+// Compile a location keyword into a word-boundary matcher.
+//
+// Plain String.includes() is wrong for location keywords because country and
+// city names are prefixes of unrelated US place names. The motivating bug:
+// blocking "india" also rejected "Indian Head, MD", "Indiana", and
+// "Indianapolis" — real US locations, silently dropped from every scan.
+// Likewise "china" would swallow "Chinatown" and "uk -" would swallow "Truck -".
+//
+// Lookarounds rather than \b so keywords that begin or end with punctuation
+// (", IND", "UK -") still anchor correctly — \b is defined relative to word
+// characters and behaves surprisingly at a punctuation edge.
+// Note: distinct from compileKeyword() above, which serves the *title* filter and
+// only boundary-anchors 2-3 letter acronyms. Location keywords need boundaries on
+// every keyword, so they get their own compiler rather than changing title-matching
+// behaviour. Returns a predicate, mirroring compileKeyword()'s shape.
+function compileLocationKeyword(keyword) {
+  const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const startsWord = /[a-z0-9]/.test(keyword[0]);
+  const endsWord = /[a-z0-9]/.test(keyword[keyword.length - 1]);
+  const prefix = startsWord ? '(?<![a-z0-9])' : '';
+  const suffix = endsWord ? '(?![a-z0-9])' : '';
+  const re = new RegExp(`${prefix}${escaped}${suffix}`);
+  return (lower) => re.test(lower);
+}
+
+function compileLocationKeywordList(value) {
+  return normalizeKeywordList(value).map(compileLocationKeyword);
+}
+
+// Some providers report a rolled-up display string ("5 Locations", "2 Locations")
+// while the canonical URL still names the real primary location. Workday is the
+// common case: .../job/Hyderabad-Telangana-India/Network-Engineer_R-65193-1 shows
+// up as "5 Locations", so no `block` keyword can ever match the location field.
+// Recover that signal by reading the path segment right after `/job/`.
+//
+// Deliberately narrow: only the post-`/job/` segment is inspected, never the whole
+// URL. Scanning the full URL would match company slugs and ATS subdomains by
+// accident (a "china" or "india" substring inside an unrelated path). Providers
+// without the `/job/{location}/` convention (Greenhouse, Lever, Ashby) yield no
+// hint and keep their previous behaviour exactly.
+export function locationHintFromUrl(url) {
+  if (typeof url !== 'string' || url.trim() === '') return '';
+  let pathname;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    return '';
+  }
+  const segments = pathname.split('/').filter(Boolean);
+  const jobIdx = segments.lastIndexOf('job');
+  if (jobIdx === -1 || jobIdx === segments.length - 1) return '';
+  let segment = segments[jobIdx + 1];
+  try {
+    segment = decodeURIComponent(segment);
+  } catch {
+    // Malformed percent-encoding — fall back to the raw segment.
+  }
+  // "Hyderabad-Telangana-India" → "hyderabad telangana india" so multi-word
+  // block keywords like "united arab emirates" can still match.
+  return segment.replace(/[-_+]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+// `url` is optional. Callers that omit it get the original location-only
+// semantics, which is what the existing unit tests exercise.
 export function buildLocationFilter(locationFilter) {
   if (!locationFilter) return () => true;
-  const alwaysAllow = normalizeKeywordList(locationFilter.always_allow);
-  const allow = normalizeKeywordList(locationFilter.allow);
-  const block = normalizeKeywordList(locationFilter.block);
+  const alwaysAllow = compileLocationKeywordList(locationFilter.always_allow);
+  const allow = compileLocationKeywordList(locationFilter.allow);
+  const block = compileLocationKeywordList(locationFilter.block);
 
-  return (location) => {
-    if (typeof location !== 'string' || location.trim() === '') return true;
-    const lower = location.toLowerCase();
-    if (alwaysAllow.length > 0 && alwaysAllow.some(k => lower.includes(k))) return true;
-    if (block.length > 0 && block.some(k => lower.includes(k))) return false;
+  return (location, url) => {
+    const lower = typeof location === 'string' ? location.trim().toLowerCase() : '';
+    const hint = locationHintFromUrl(url);
+    // Nothing to judge on either field → pass (don't penalize missing data).
+    if (lower === '' && hint === '') return true;
+    const matches = (m) => (lower !== '' && m(lower)) || (hint !== '' && m(hint));
+    // always_allow still wins over block, and may be satisfied by either field:
+    // a genuinely US role whose display string says "United States" is never
+    // rejected because of what its URL happens to contain.
+    if (alwaysAllow.length > 0 && alwaysAllow.some(matches)) return true;
+    if (block.length > 0 && block.some(matches)) return false;
     if (allow.length === 0) return true;
-    return allow.some(k => lower.includes(k));
+    return allow.some(matches);
   };
 }
 
@@ -654,15 +726,29 @@ const DEDUP_STRIP_PARAMS = new Set([
   'language', 'lang', 'locale',
   'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
   'ref', 'src', 'source', 'gh_src', 'lever-origin', 'lever-source',
+  'rltr', // StepStone: regenerated per request, so one posting returns as new every scan
 ]);
 
 /**
  * Normalize a job posting URL into a stable dedup key.
  *
  * Strips cosmetic query params (locale/tracking), drops a trailing slash,
- * and lowercases scheme + host. Only used to compute the *comparison* key —
- * callers keep writing/displaying the original URL so links stay clickable
- * and scan-history/pipeline.md stay faithful to what the provider returned.
+ * and lowercases scheme, host, and path. Only used to compute the
+ * *comparison* key — callers keep writing/displaying the original URL so
+ * links stay clickable and scan-history/pipeline.md stay faithful to what
+ * the provider returned.
+ *
+ * The path is lowercased because scan.mjs and scan-ats-full.mjs run as
+ * separate processes and can independently produce different casing for the
+ * identical posting — a Workday tenant/site path segment reached via the
+ * curated portals.yml entry vs. the reverse-ATS dataset, for instance. A
+ * case-sensitive key silently treats those as two distinct URLs, so the same
+ * role lands in pipeline.md twice. Path casing is not meaningfully distinct
+ * for any provider these scanners target.
+ *
+ * Query *values* keep their original casing — those can be identity-bearing
+ * (Greenhouse's `gh_jid`), which is also why DEDUP_STRIP_PARAMS is an
+ * allowlist rather than a blanket strip.
  *
  * Falls back to the raw string when the URL is malformed, preserving the
  * old byte-for-byte behavior for unparsable history rows.
@@ -684,7 +770,7 @@ export function normalizeUrlForDedup(url) {
     }
   }
   parsed.hash = '';
-  parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '').toLowerCase() || '/';
   return parsed.toString();
 }
 
@@ -1231,6 +1317,17 @@ export function formatScanHistoryRow(offer, date, status = 'added') {
     // posting or a scan without trust_filter leaves both empty.
     trustIsFlagged(offer) ? String(offer.trustScore) : '',
     trustIsFlagged(offer) ? trustFlagList(offer).join(',') : '',
+    // Normalized company key (#2093): the canonical company form shared across
+    // the tracker (normalizeCompanyName — lowercased, punctuation/whitespace
+    // folded, trailing legal-entity suffixes stripped) so "Acme Inc.",
+    // "Acme, Inc." and "ACME  Inc" all key to `acme`. Stored at write time so
+    // repost/name-matching never has to route through executing a script, and
+    // the raw display company in col 5 stays faithful to what the provider
+    // returned. Trailing col 12 — purely additive: index-based readers
+    // (fingerprint@7, postedAt@8, trust@9-10, and the web parser's first 7
+    // cols) are unaffected, and older rows that lack it are tolerated by
+    // consumers normalizing the raw name on the fly.
+    normalizeCompanyName(offer.company || ''),
   ].map(sanitizeTsvField).join('\t');
 }
 
@@ -1246,6 +1343,11 @@ export function loadFingerprintHistory(historyPath = SCAN_HISTORY_PATH) {
   const rows = [];
   for (const line of readFileSync(historyPath, 'utf-8').split('\n')) {
     const cols = line.split('\t');
+    // Skip the header row. Older 7-col headers fall out of the `cols.length < 8`
+    // guard below on their own, but the 12-col header names col 7 `fingerprint`
+    // (non-empty), so it would otherwise pass that guard and be read as data.
+    // Real rows always carry a URL in col 0, never the literal `url`.
+    if (cols[0] === 'url') continue;
     if (cols.length < 8 || !cols[7].trim()) continue;
     rows.push({
       url: (cols[0] || '').trim(),
@@ -1274,49 +1376,60 @@ Paste job URLs below as \`- [ ] {url}\` then run \`/career-ops pipeline\`.
 const PENDING_MARKERS = ['## Pending', '## Pendientes'];
 const PROCESSED_MARKERS = ['## Processed', '## Procesadas'];
 
-export function appendToPipeline(offers) {
+// Locked (pipeline-lock.mjs) so scan.mjs, scan-ats-full.mjs, and plugins.mjs
+// (pipeline mode) — the three current callers — can never interleave their
+// read-modify-write and silently drop each other's offers.
+export async function appendToPipeline(offers) {
   if (offers.length === 0) return;
 
-  // Auto-create with standard skeleton if missing (fresh-install guard).
-  if (!existsSync(PIPELINE_PATH)) {
-    writeFileSync(PIPELINE_PATH, PIPELINE_SKELETON, 'utf-8');
-  }
+  await withPipelineLock(PIPELINE_PATH, async () => {
+    // Auto-create with standard skeleton if missing (fresh-install guard).
+    if (!existsSync(PIPELINE_PATH)) {
+      writeFileSync(PIPELINE_PATH, PIPELINE_SKELETON, 'utf-8');
+    }
 
-  let text = readFileSync(PIPELINE_PATH, 'utf-8');
+    let text = readFileSync(PIPELINE_PATH, 'utf-8');
 
-  const marker = PENDING_MARKERS.find(m => text.includes(m)) ?? null;
-  const idx = marker !== null ? text.indexOf(marker) : -1;
+    const marker = PENDING_MARKERS.find(m => text.includes(m)) ?? null;
+    const idx = marker !== null ? text.indexOf(marker) : -1;
 
-  if (idx === -1) {
-    // No Pending section found — insert one before Processed (or at end)
-    const procIdx = PROCESSED_MARKERS.reduce((found, m) => {
-      const i = text.indexOf(m);
-      return (found === -1 || (i !== -1 && i < found)) ? i : found;
-    }, -1);
-    const insertAt = procIdx === -1 ? text.length : procIdx;
-    const block = `\n## Pending\n\n` + offers.map(formatPipelineOffer).join('\n') + '\n\n';
-    text = text.slice(0, insertAt) + block + text.slice(insertAt);
-  } else {
-    // Find the end of existing Pending content (next ## or end)
-    const afterMarker = idx + marker.length;
-    const nextSection = text.indexOf('\n## ', afterMarker);
-    const insertAt = nextSection === -1 ? text.length : nextSection;
+    if (idx === -1) {
+      // No Pending section found — insert one before Processed (or at end)
+      const procIdx = PROCESSED_MARKERS.reduce((found, m) => {
+        const i = text.indexOf(m);
+        return (found === -1 || (i !== -1 && i < found)) ? i : found;
+      }, -1);
+      const insertAt = procIdx === -1 ? text.length : procIdx;
+      const block = `\n## Pending\n\n` + offers.map(formatPipelineOffer).join('\n') + '\n\n';
+      text = text.slice(0, insertAt) + block + text.slice(insertAt);
+    } else {
+      // Find the end of existing Pending content (next ## or end)
+      const afterMarker = idx + marker.length;
+      const nextSection = text.indexOf('\n## ', afterMarker);
+      const insertAt = nextSection === -1 ? text.length : nextSection;
 
-    const block = '\n' + offers.map(formatPipelineOffer).join('\n') + '\n';
-    text = text.slice(0, insertAt) + block + text.slice(insertAt);
-  }
+      const block = '\n' + offers.map(formatPipelineOffer).join('\n') + '\n';
+      text = text.slice(0, insertAt) + block + text.slice(insertAt);
+    }
 
-  writeFileSync(PIPELINE_PATH, text, 'utf-8');
+    writeFileSync(PIPELINE_PATH, text, 'utf-8');
+  });
 }
 
 export function appendToScanHistory(offers, date, status = 'added') {
-  // Ensure file + header exist. Location appended as 7th column for non-breaking
-  // backward compat — older scan-history.tsv files with 6 columns still parse fine
-  // since loadSeenUrls only reads column 0. `status` is parameterized so callers
-  // can record verify outcomes (`skipped_expired`, etc.) without the legacy
-  // `(expired)` suffix in `source`.
+  // Ensure file + header exist. The header names every column the row writer
+  // (formatScanHistoryRow) emits, in the same order: the original 7 positional
+  // cols (url…location) plus the append-only trailing cols added since —
+  // fingerprint (7), posted_at (8), trust_score (9), trust_flags (10),
+  // normalized_company (11). Written ONLY on fresh-file creation; existing files
+  // (including headerless legacy files and older 7-col-header files) are never
+  // rewritten. All readers either skip line 0 unconditionally, detect the header
+  // by its `url\t` prefix, or skip non-URL col-0 rows, so widening it stays
+  // backward-compatible. `status` is parameterized so callers can record verify
+  // outcomes (`skipped_expired`, etc.) without the legacy `(expired)` suffix.
   if (!existsSync(SCAN_HISTORY_PATH)) {
-    writeFileSync(SCAN_HISTORY_PATH, 'url\tfirst_seen\tportal\ttitle\tcompany\tstatus\tlocation\n', 'utf-8');
+    mkdirSync(path.dirname(SCAN_HISTORY_PATH), { recursive: true });
+    writeFileSync(SCAN_HISTORY_PATH, 'url\tfirst_seen\tportal\ttitle\tcompany\tstatus\tlocation\tfingerprint\tposted_at\ttrust_score\ttrust_flags\tnormalized_company\n', 'utf-8');
   }
 
   const lines = offers.map(o => formatScanHistoryRow(o, date, status)).join('\n') + '\n';
@@ -1436,10 +1549,14 @@ export function loadPortalHealth(filePath = PORTAL_HEALTH_PATH) {
 export function computeConsecutiveFailures(healthRecords) {
   const streaks = new Map();
   for (const r of healthRecords) {
-    if (r.status === 'slug_gone' || r.status === 'network') {
-      streaks.set(r.company, (streaks.get(r.company) || 0) + 1);
-    } else if (r.status === 'reachable' || r.status === 'empty') {
+    // Healthy statuses reset the streak; every other status counts toward it.
+    // Inverted (vs. listing failure statuses) so the newer error kinds
+    // (auth/server/unknown) can't silently fall outside the streak again.
+    // 'empty' is deliberately healthy: a live board with 0 jobs is reachable.
+    if (r.status === 'reachable' || r.status === 'empty') {
       streaks.set(r.company, 0);
+    } else {
+      streaks.set(r.company, (streaks.get(r.company) || 0) + 1);
     }
   }
   return streaks;
@@ -1830,7 +1947,7 @@ async function main() {
           totalFilteredTier++;
           continue;
         }
-        if (!locationFilter(job.location)) {
+        if (!locationFilter(job.location, job.url)) {
           totalFilteredLocation++;
           continue;
         }
@@ -1930,7 +2047,7 @@ async function main() {
 
   // 6. Write results
   if (!dryRun && verifiedOffers.length > 0) {
-    appendToPipeline(verifiedOffers);
+    await appendToPipeline(verifiedOffers);
     appendToScanHistory(verifiedOffers, date);
   }
   if (!dryRun && cooldownOffers.length > 0) {
@@ -1984,11 +2101,15 @@ async function main() {
   console.log(`Companies scanned:     ${summaryCompanies}`);
   if (summaryBoards > 0) console.log(`Job boards scanned:    ${summaryBoards}`);
   console.log(`Total jobs found:      ${totalFound}`);
-  console.log(`Filtered by title:     ${totalFilteredTitle} removed`);
+  if (config.title_filter || totalFilteredTitle > 0) {
+    console.log(`Filtered by title:     ${totalFilteredTitle} removed`);
+  }
   if (skipTiers.length > 0) {
     console.log(`Filtered by tier:      ${totalFilteredTier} removed`);
   }
-  console.log(`Filtered by location:  ${totalFilteredLocation} removed`);
+  if (config.location_filter || totalFilteredLocation > 0) {
+    console.log(`Filtered by location:  ${totalFilteredLocation} removed`);
+  }
   if (config.max_posting_age_days != null || totalFilteredPostingAge > 0) {
     console.log(`Filtered by age:       ${totalFilteredPostingAge} removed`);
   }
@@ -2075,16 +2196,21 @@ async function main() {
   const nowStr = new Date().toISOString();
   const healthRecords = [];
   
+  // Record each errored target under its real classifyFetchError kind. Before
+  // this, only slug_gone/network were recorded and auth (401/403), server
+  // (5xx), and unknown fell through to 'reachable' — so a portal WAF-403ing
+  // every run was logged as healthy forever and never reached the 🚨 streak
+  // escalation. The TSV status vocabulary is additive: auth/server/unknown
+  // join the existing reachable|slug_gone|network|empty.
+  const errorKindByCompany = new Map(
+    errors.filter((e) => e.kind).map((e) => [e.company, e.kind])
+  );
   for (const t of targets) {
-    const isUnreachable = unreachableTargets.some(e => e.company === t.name);
-    const isNetwork = networkTargets.some(e => e.company === t.name);
     const isEmpty = emptyTargets.includes(t.name);
-    
-    let status = 'reachable';
-    if (isUnreachable) status = 'slug_gone';
-    else if (isNetwork) status = 'network';
-    else if (isEmpty) status = 'empty';
-    
+
+    let status = errorKindByCompany.get(t.name) || 'reachable';
+    if (status === 'reachable' && isEmpty) status = 'empty';
+
     healthRecords.push({ timestamp: nowStr, company: t.name, status });
   }
 
@@ -2095,16 +2221,18 @@ async function main() {
   const newlyDeadSlug = [];
   const newlyDeadNetwork = [];
   
-  for (const e of [...unreachableTargets, ...networkTargets]) {
+  // All error kinds can reach the 🚨 persistent list (auth/server/unknown
+  // included — a WAF that 403s the scanner every run is coverage decay too).
+  // Below threshold, only slug_gone/network keep their dedicated warnings;
+  // auth/server/unknown stay in the one-off `Errors (N):` print below.
+  for (const e of [...unreachableTargets, ...networkTargets, ...otherErrors.filter((x) => x.kind)]) {
     const streak = currentStreaks.get(e.company) || 1;
     if (streak >= STREAK_THRESHOLD) {
       if (!persistentlyDead.includes(e.company)) persistentlyDead.push(e.company);
-    } else {
-      if (e.kind === 'slug_gone') {
-        if (!newlyDeadSlug.some(x => x.company === e.company)) newlyDeadSlug.push(e);
-      } else {
-        newlyDeadNetwork.push(e);
-      }
+    } else if (e.kind === 'slug_gone') {
+      if (!newlyDeadSlug.some(x => x.company === e.company)) newlyDeadSlug.push(e);
+    } else if (e.kind === 'network') {
+      newlyDeadNetwork.push(e);
     }
   }
 
