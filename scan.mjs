@@ -46,6 +46,7 @@ import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
 import { normalizeCompanyName } from './invite-match.mjs';
 import { withPipelineLock } from './pipeline-lock.mjs';
+import { withPortalHealthLock } from './portal-health-lock.mjs';
 
 try {
   const { config } = await import('dotenv');
@@ -146,7 +147,8 @@ export function matchedTitleKeywords(title, titleFilter) {
 //     the home region is an option, even though "france" is blocked)
 //   - `block` matches → reject
 //   - `allow` empty → pass (already cleared block)
-//   - `allow` non-empty → must match at least one keyword
+//   - `allow` non-empty → must match at least one keyword, OR the TITLE carries
+//     an explicit remote marker (see titleSignalsRemote below)
 
 // Normalize a keyword list from portals.yml: tolerates a bare string
 // (wrapped to a 1-item array), null/undefined (→ []), and non-string
@@ -225,15 +227,60 @@ export function locationHintFromUrl(url) {
   return segment.replace(/[-_+]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-// `url` is optional. Callers that omit it get the original location-only
-// semantics, which is what the existing unit tests exercise.
+// Some ATSs report the hiring office as the location even when the role is
+// remote, and state the remoteness in the TITLE instead: Radancy/TalentBrew
+// tenants return bare "City, State" strings, so
+//   "Program Manager - Remote"  ->  location "Las Vegas, Nevada"
+// An `allow` list written in country/region terms ("united states", "remote")
+// then rejects a genuinely remote US role. Live measurement on
+// careers.unitedhealthgroup.com: 14 PM-family postings, 0 passed `allow`,
+// 5 of them said "Remote" outright in the title.
+//
+// Only an unambiguous work-arrangement marker counts. A bare /remote/ test
+// would admit domain compounds — "Remote Sensing Program Manager" is an
+// on-site GIS role, and Esri (a tracked company) posts exactly those. So
+// "remote" must be followed by end-of-string, a non-letter (")", ",", "-"),
+// or " in …" as in "Remote in MO" — never by another word, which is what makes
+// "remote sensing" / "remote monitoring" compounds.
+export const REMOTE_TITLE_RE = /(?<![a-z])remote(?=$|\s*[^a-z\s]|\s+in\b)/;
+
+// …and a negation before the word has to lose, which the marker regex alone
+// cannot see: in "Non-Remote" / "Not Remote" the delimiter clears the lookbehind
+// and the trailing position clears the lookahead, so an explicitly on-site role
+// would bypass a non-empty `allow` list — the exact opposite of the intent.
+// The separator class must be at least as broad as the marker's own delimiter
+// lookahead, or the guard is trivially sidestepped. An ASCII-only `[\s-]*` let
+// every non-ASCII dash through — "Non–Remote" (en dash), "Non‑Remote"
+// (non-breaking hyphen), em dash, figure dash and minus all still read as
+// remote. `[^a-z]*` matches the marker's breadth: it spans any run of
+// non-letters, so no punctuation variant can slip between the negation and the
+// word.
+// It cannot over-reach, because it never crosses a letter: in "Nonprofit
+// Program Manager - Remote" the run after "non" starts with "profit", so the
+// negation cannot reach "remote". Same for "Not-for-Profit … - Remote",
+// "Nordic … - Remote", "Notary … - Remote".
+// A negation anywhere in the title disqualifies it. Over-rejecting here is the
+// safe direction: this tier only ever *rescues* a posting, so a false negative
+// restores the previous behavior while a false positive admits an on-site role.
+export const REMOTE_NEGATED_RE = /\b(?:non|not|no)[^a-z]*remote/;
+
+/** @param {unknown} title @returns {boolean} whether the title marks the role remote. */
+export function titleSignalsRemote(title) {
+  if (typeof title !== 'string' || title.trim() === '') return false;
+  const lower = title.toLowerCase();
+  if (REMOTE_NEGATED_RE.test(lower)) return false;
+  return REMOTE_TITLE_RE.test(lower);
+}
+
+// `url` and `title` are optional. Callers that omit them get the original
+// location-only semantics, which is what the existing unit tests exercise.
 export function buildLocationFilter(locationFilter) {
   if (!locationFilter) return () => true;
   const alwaysAllow = compileLocationKeywordList(locationFilter.always_allow);
   const allow = compileLocationKeywordList(locationFilter.allow);
   const block = compileLocationKeywordList(locationFilter.block);
 
-  return (location, url) => {
+  return (location, url, title) => {
     const lower = typeof location === 'string' ? location.trim().toLowerCase() : '';
     const hint = locationHintFromUrl(url);
     // Nothing to judge on either field → pass (don't penalize missing data).
@@ -245,7 +292,11 @@ export function buildLocationFilter(locationFilter) {
     if (alwaysAllow.length > 0 && alwaysAllow.some(matches)) return true;
     if (block.length > 0 && block.some(matches)) return false;
     if (allow.length === 0) return true;
-    return allow.some(matches);
+    if (allow.some(matches)) return true;
+    // Last resort only. Deliberately placed AFTER `block` so a remote title can
+    // never rescue a blocked location — "Program Manager - Remote" in Bengaluru
+    // stays rejected. This widens `allow`, never `block`.
+    return titleSignalsRemote(title);
   };
 }
 
@@ -347,6 +398,77 @@ export function buildContentFilter(contentFilter) {
     if (negative.length > 0 && negative.some(k => lower.includes(k))) return false;
     if (positive.length === 0) return true;
     return positive.some(k => lower.includes(k));
+  };
+}
+
+// ── Country-eligibility filter (#2093) ──────────────────────────────
+// Optional, opt-in. If `country_eligibility_filter` is absent from
+// portals.yml, all jobs pass — byte-identical to pre-#2093 behavior.
+//
+// Problem it solves: `location_filter` only reads the ATS provider's
+// STRUCTURED location field (e.g. "Remote"), which many US companies use
+// identically regardless of actual country eligibility. The real
+// restriction — "US-based candidates only" vs. "US or Canada eligible" —
+// often lives only in the JD DESCRIPTION body text, which this filter reads
+// (same field `content_filter` already reads — `job.description`).
+//
+// Semantics (case-insensitive substring), mirroring location_filter's
+// "don't penalize missing data" discipline exactly:
+//   - Candidate's own `location.country` (config/profile.yml) is "United
+//     States" → always pass, unconditionally. An exclusionary "US only"
+//     phrase can never legitimately block a US-based candidate, so the
+//     filter no-ops entirely rather than special-casing every keyword check.
+//   - Empty / whitespace-only / non-string description → pass (no signal).
+//   - No `exclusionary` phrase matched → pass (ambiguous stays ambiguous,
+//     never guessed — this also means an `inclusive`-only match with no
+//     exclusionary wording present is a no-op pass, same as having no
+//     signal at all).
+//   - `exclusionary` phrase matched AND an `inclusive` phrase is also
+//     present → pass (the posting explicitly widens eligibility).
+//   - `exclusionary` phrase matched AND the candidate's own country is
+//     literally named in the JD text (e.g. a Canadian candidate scanning a
+//     posting that separately mentions "Canada" elsewhere) → pass.
+//   - `exclusionary` phrase matched, no `inclusive` phrase, and the
+//     candidate's own country isn't named → reject.
+//
+// Config shape (portals.yml):
+//   country_eligibility_filter:
+//     exclusionary: ["must be located in the united states", ...]
+//     inclusive: ["united states or canada", "north america", ...]
+//
+// Kept as a sibling block to `content_filter` rather than folded into its
+// positive/negative shape: this filter cross-references
+// `config/profile.yml`'s `location.country` and has its own three-way
+// exclusionary/inclusive/candidate-country-named semantics, which doesn't
+// fit content_filter's simpler two-list reject/require shape.
+
+export function buildCountryEligibilityFilter(countryEligibilityFilter, candidateCountry) {
+  if (!countryEligibilityFilter) return () => true;
+
+  const candidateCountryLower = typeof candidateCountry === 'string'
+    ? candidateCountry.toLowerCase().trim()
+    : '';
+
+  // A "US-based candidates only" restriction can never legitimately exclude
+  // a candidate who is themselves US-based — no-op the whole filter rather
+  // than relying on the literal-country-name check below (which would miss
+  // phrasing like "US-based candidates only" that never spells out "united
+  // states").
+  if (candidateCountryLower === 'united states') return () => true;
+
+  const exclusionary = normalizeKeywordList(countryEligibilityFilter.exclusionary);
+  const inclusive = normalizeKeywordList(countryEligibilityFilter.inclusive);
+
+  return (description) => {
+    if (typeof description !== 'string' || description.trim() === '') return true;
+    const lower = description.toLowerCase();
+
+    if (exclusionary.length === 0) return true;
+    if (!exclusionary.some(k => lower.includes(k))) return true;
+    if (inclusive.length > 0 && inclusive.some(k => lower.includes(k))) return true;
+    if (candidateCountryLower && lower.includes(candidateCountryLower)) return true;
+
+    return false;
   };
 }
 
@@ -507,6 +629,25 @@ export function addDays(dateStr, days) {
   const date = new Date(`${dateStr}T00:00:00Z`);
   date.setUTCDate(date.getUTCDate() + days);
   return date.toISOString().slice(0, 10);
+}
+
+// Reads config/profile.yml's `location.country` (already a documented
+// profile field — see config/profile.example.yml) for the country-
+// eligibility filter (#2093). Missing file, missing field, or a malformed
+// profile all resolve to '' — buildCountryEligibilityFilter treats an empty
+// candidate country the same as "not the candidate's own country's US
+// no-op" and simply skips the literal-country-name pass-through, which is
+// the same conservative "don't penalize missing data" default used
+// throughout this file.
+export function loadCandidateCountry(profilePath = PROFILE_PATH) {
+  if (!existsSync(profilePath)) return '';
+  try {
+    const raw = yaml.load(readFileSync(profilePath, 'utf-8')) || {};
+    const country = raw?.location?.country;
+    return typeof country === 'string' ? country.trim() : '';
+  } catch {
+    return '';
+  }
 }
 
 export function loadReApplyWindows(profilePath = PROFILE_PATH) {
@@ -1496,7 +1637,7 @@ const SCAN_RUNS_PATH = 'data/scan-runs.tsv';
 // 'completed' in v1; a follow-up wires failure-path writes so trend stats can
 // exclude survivorship bias. Consumers MUST parse by header name, never by
 // position — columns may be appended in later versions.
-export const SCAN_RUNS_HEADER = 'timestamp\tstatus\tcompanies\tboards\tfound\tfiltered_title\tfiltered_tier\tfiltered_location\tfiltered_posting_age\tfiltered_salary\tfiltered_content\tfiltered_cooldown\tdupes\tnew_added\terrors\tfiltered_blacklist\tfiltered_visa\tfiltered_posted_date\n';
+export const SCAN_RUNS_HEADER = 'timestamp\tstatus\tcompanies\tboards\tfound\tfiltered_title\tfiltered_tier\tfiltered_location\tfiltered_posting_age\tfiltered_salary\tfiltered_content\tfiltered_cooldown\tdupes\tnew_added\terrors\tfiltered_blacklist\tfiltered_visa\tfiltered_posted_date\tfiltered_country_eligibility\n';
 
 export function appendScanRunSummary(c, filePath = SCAN_RUNS_PATH) {
   if (!existsSync(filePath)) writeFileSync(filePath, SCAN_RUNS_HEADER, 'utf-8');
@@ -1512,23 +1653,30 @@ export function appendScanRunSummary(c, filePath = SCAN_RUNS_PATH) {
     c.filteredVisa ?? 0,
     // filtered_posted_date appended at the END for the same reason.
     c.filteredPostedDate ?? 0,
+    // filtered_country_eligibility (#2093) appended at the END for the same reason.
+    c.filteredCountryEligibility ?? 0,
   ].join('\t') + '\n';
   appendFileSync(filePath, row, 'utf-8');
 }
 
 // ── Portal health persistence (#1744) ───────────────────────────────
 
-const PORTAL_HEALTH_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'portal-health.tsv');
+const PORTAL_HEALTH_PATH = 'data/portal-health.tsv';
 export const PORTAL_HEALTH_HEADER = 'timestamp\tcompany\tstatus\n';
 
-export function appendPortalHealth(healthRecords, filePath = PORTAL_HEALTH_PATH) {
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  if (!existsSync(filePath)) writeFileSync(filePath, PORTAL_HEALTH_HEADER, 'utf-8');
-  let lines = '';
-  for (const r of healthRecords) {
-    lines += [r.timestamp, r.company, r.status].join('\t') + '\n';
-  }
-  if (lines) appendFileSync(filePath, lines, 'utf-8');
+// Locked (portal-health-lock.mjs) so a concurrent read-modify-write of this
+// same file — e.g. tests/portal-health-guard.mjs's regression-cleanup path —
+// can never interleave with this append and silently discard one side.
+export async function appendPortalHealth(healthRecords, filePath = PORTAL_HEALTH_PATH) {
+  await withPortalHealthLock(filePath, async () => {
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    if (!existsSync(filePath)) writeFileSync(filePath, PORTAL_HEALTH_HEADER, 'utf-8');
+    let lines = '';
+    for (const r of healthRecords) {
+      lines += [r.timestamp, r.company, r.status].join('\t') + '\n';
+    }
+    if (lines) appendFileSync(filePath, lines, 'utf-8');
+  });
 }
 
 export function loadPortalHealth(filePath = PORTAL_HEALTH_PATH) {
@@ -1790,6 +1938,8 @@ async function main() {
   const salaryFilter = buildSalaryFilter(config.salary_filter);
   const trustValidator = buildTrustValidator(config.trust_filter);
   const contentFilter = buildContentFilter(config.content_filter);
+  const candidateCountry = loadCandidateCountry();
+  const countryEligibilityFilter = buildCountryEligibilityFilter(config.country_eligibility_filter, candidateCountry);
   const visaFilter = buildVisaFilter(config.visa_filter);
   const visaEnabled = Boolean(config.visa_filter) && config.visa_filter.enabled !== false;
 
@@ -1876,6 +2026,7 @@ async function main() {
   let totalFilteredPostedDate = 0;
   let totalFilteredSalary = 0;
   let totalFilteredContent = 0;
+  let totalFilteredCountryEligibility = 0;
   let totalFilteredBlacklist = 0;
   let annotatedBlacklisted = 0;
   let totalFilteredVisa = 0;
@@ -1947,7 +2098,9 @@ async function main() {
           totalFilteredTier++;
           continue;
         }
-        if (!locationFilter(job.location, job.url)) {
+        // job.title is passed so a role whose remoteness is stated in the title
+        // ("Program Manager - Remote") isn't rejected for a city-only location.
+        if (!locationFilter(job.location, job.url, job.title)) {
           totalFilteredLocation++;
           continue;
         }
@@ -1965,6 +2118,10 @@ async function main() {
         }
         if (!contentFilter(job.description, matchedTitleKeywords(job.title, config.title_filter))) {
           totalFilteredContent++;
+          continue;
+        }
+        if (!countryEligibilityFilter(job.description)) {
+          totalFilteredCountryEligibility++;
           continue;
         }
         if (!visaFilter(job.description)) {
@@ -2121,6 +2278,9 @@ async function main() {
   }
   if (config.content_filter || totalFilteredContent > 0) {
     console.log(`Filtered by content:   ${totalFilteredContent} removed`);
+  }
+  if (config.country_eligibility_filter || totalFilteredCountryEligibility > 0) {
+    console.log(`Filtered by country eligibility: ${totalFilteredCountryEligibility} removed`);
   }
   if (visaEnabled) {
     console.log(`Filtered by visa:      ${totalFilteredVisa} removed`);
@@ -2280,7 +2440,7 @@ async function main() {
   // Persist this run's counters (#1604) — guarded exactly like the other
   // writes; a --dry-run must leave no trace.
   if (!dryRun) {
-    appendPortalHealth(healthRecords);
+    await appendPortalHealth(healthRecords);
     appendScanRunSummary({
       timestamp: new Date().toISOString(), status: 'completed',
       companies: summaryCompanies, boards: summaryBoards, found: totalFound,
@@ -2292,6 +2452,7 @@ async function main() {
       filteredBlacklist: totalFilteredBlacklist,
       filteredVisa: totalFilteredVisa,
       filteredPostedDate: totalFilteredPostedDate,
+      filteredCountryEligibility: totalFilteredCountryEligibility,
     });
   }
 
