@@ -2014,6 +2014,19 @@ if (!DRY_RUN) {
   }
 }
 
+// Auto LinkedIn network lookup for newly added companies
+if (!DRY_RUN && added > 0) {
+  try {
+    execFileSync(
+      process.execPath,
+      [join(CAREER_OPS_CODE_ROOT, 'network-lookup.mjs'), '--last', String(added)],
+      { stdio: 'inherit' }
+    );
+  } catch {
+    // non-zero exit just means no connections found — not an error
+  }
+}
+
 // Optional verify
 if (VERIFY && !DRY_RUN) {
   console.log('\n--- Running verification ---');

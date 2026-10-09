@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import yaml from 'js-yaml';
+import { load as yamlLoad } from 'js-yaml';
 import { pickCV } from './archetype-cv.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -44,7 +44,7 @@ const OVERRIDE_LOC = flagVal('--location');
 
 if (!existsSync(BATCH_DIR)) mkdirSync(BATCH_DIR, { recursive: true });
 
-const profile = yaml.load(readFileSync(join(__dirname, 'config', 'profile.yml'), 'utf8'));
+const profile = yamlLoad(readFileSync(join(__dirname, 'config', 'profile.yml'), 'utf8'));
 const c = profile.candidate;
 const ME = {
   firstName:   c.full_name?.split(' ')[0] ?? 'Tanmay',
@@ -91,11 +91,18 @@ async function saveSessionFlow() {
   const ctx = await browser.newContext();
   const pg = await ctx.newPage();
   await pg.goto('https://www.linkedin.com/login');
-  console.log('Log in to LinkedIn in the browser window. Waiting for /feed...');
-  await pg.waitForURL('**/feed**', { timeout: 120_000 });
+
+  console.log('\n─────────────────────────────────────────────────────');
+  console.log('LinkedIn browser is open.');
+  console.log('⚠️  DO NOT click "Sign in with Google" — it is blocked.');
+  console.log('✅  Type your LinkedIn EMAIL + PASSWORD directly, then click Sign In.');
+  console.log('Waiting up to 5 minutes for you to log in...');
+  console.log('─────────────────────────────────────────────────────\n');
+
+  await pg.waitForURL('**/feed**', { timeout: 300_000 });
   const cookies = await ctx.cookies();
   saveSession({ cookies, applied: [] });
-  console.log(`Session saved to ${SESSION_FILE}`);
+  console.log(`\n✅ Session saved to ${SESSION_FILE}`);
   await browser.close();
 }
 
