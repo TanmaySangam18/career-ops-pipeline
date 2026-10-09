@@ -321,7 +321,19 @@ async function run() {
   const ctx = await browser.newContext();
 
   if (session.cookies?.length) {
-    await ctx.addCookies(session.cookies);
+    const now = Date.now() / 1000;
+    const validSameSite = new Set(['Strict', 'Lax', 'None']);
+    const clean = session.cookies
+      .filter(c => !(c.expires > 0 && c.expires < now))
+      .map(({ name, value, domain, path, expires, httpOnly, secure, sameSite }) => {
+        const out = { name, value, domain, path };
+        if (typeof expires === 'number') out.expires = expires;
+        if (typeof httpOnly === 'boolean') out.httpOnly = httpOnly;
+        if (typeof secure === 'boolean') out.secure = secure;
+        if (sameSite && validSameSite.has(sameSite)) out.sameSite = sameSite;
+        return out;
+      });
+    await ctx.addCookies(clean);
   }
 
   const pg = await ctx.newPage();
