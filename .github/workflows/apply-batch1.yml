@@ -1,0 +1,126 @@
+name: Apply Batch 1 — 8:00 AM ET
+
+on:
+  schedule:
+    - cron: '0 12 * * 1-5'   # Mon-Fri 12:00 UTC = 8:00 AM EDT
+    - cron: '0 13 * * 1-5'   # Mon-Fri 13:00 UTC = 8:00 AM EST (post-Nov 1)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+
+      - name: Restore profile.yml from secret
+        run: |
+          mkdir -p config batch output
+          printf '%s' "$PROFILE_YAML" > config/profile.yml
+        env:
+          PROFILE_YAML: ${{ secrets.PROFILE_YAML }}
+
+      - name: Restore LinkedIn session (artifact → secret fallback)
+        run: |
+          mkdir -p batch
+          # Try latest artifact via API
+          ARTIFACT_URL=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=linkedin-session&per_page=1" \
+            --jq '.artifacts[0].archive_download_url // empty' 2>/dev/null || true)
+          if [ -n "$ARTIFACT_URL" ]; then
+            curl -sL -H "Authorization: Bearer $GH_TOKEN" "$ARTIFACT_URL" -o _sess.zip \
+              && unzip -qo _sess.zip -d batch/ 2>/dev/null \
+              && echo "✅ Session from artifact" || true
+            rm -f _sess.zip
+          fi
+          # Fallback: bootstrap from secret
+          if [ ! -s batch/linkedin-session.json ]; then
+            echo "$LINKEDIN_SESSION" | base64 -d > batch/linkedin-session.json
+            echo "✅ Session from secret"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINKEDIN_SESSION: ${{ secrets.LINKEDIN_SESSION }}
+
+      - name: Restore apply-queue (artifact)
+        run: |
+          ARTIFACT_URL=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=apply-queue&per_page=1" \
+            --jq '.artifacts[0].archive_download_url // empty' 2>/dev/null || true)
+          if [ -n "$ARTIFACT_URL" ]; then
+            curl -sL -H "Authorization: Bearer $GH_TOKEN" "$ARTIFACT_URL" -o _q.zip \
+              && unzip -qo _q.zip -d batch/ 2>/dev/null \
+              && echo "✅ Queue from artifact" || true
+            rm -f _q.zip
+          fi
+          [ -s batch/apply-queue.json ] || echo '[]' > batch/apply-queue.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: LinkedIn Easy Apply — 150 apps
+        run: node linkedin-easy-apply.mjs --headless --max 150
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        continue-on-error: true
+
+      - name: ATS Batch Apply (from queue)
+        run: |
+          if [ -s batch/apply-queue.json ] && [ "$(cat batch/apply-queue.json)" != "[]" ]; then
+            node apply-batch-v2.mjs \
+              --queue batch/apply-queue.json \
+              --headless \
+              --tier-a-only \
+              --concurrency 2
+          else
+            echo "No ATS queue entries — skipping"
+          fi
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        continue-on-error: true
+
+      - name: Save LinkedIn session artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linkedin-session
+          path: batch/linkedin-session.json
+          overwrite: true
+          retention-days: 90
+
+      - name: Save apply-queue artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apply-queue
+          path: batch/apply-queue.json
+          overwrite: true
+          retention-days: 7
+
+      - name: Push notification — complete
+        if: always()
+        run: |
+          STATUS="✅"
+          [ "${{ job.status }}" = "failure" ] && STATUS="⚠️"
+          curl -s -X POST "https://ntfy.sh/${NTFY_TOPIC}" \
+            -H "Title: ${STATUS} Batch 1 done (8AM ET)" \
+            -H "Priority: default" \
+            -H "Tags: briefcase" \
+            -d "150 apps sent. Check sangam.d@northeastern.edu for confirmations."
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
