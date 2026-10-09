@@ -47,7 +47,7 @@ jobs:
       # Latest step at the bottom reads the manifest from it.
       - uses: actions/checkout@v7
         if: ${{ steps.release.outputs.releases_created == 'true' || github.event_name == 'workflow_dispatch' }}
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v6
         if: ${{ steps.release.outputs.release_created || github.event_name == 'workflow_dispatch' }}
         with:
           node-version: 24
